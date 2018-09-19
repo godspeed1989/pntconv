@@ -3,6 +3,7 @@
 """
 import os
 import sys
+import time
 import importlib
 import numpy as np
 import h5py
@@ -134,6 +135,7 @@ def eval_one_epoch(f, sess, ops, has_aux):
             dump_file.create_dataset('max_idx', [num_batches * f['batch_size'], 512], dtype=int)
 
         bar = ProgressBar(maxval=num_batches).start()
+        total_time = 0
         for batch_idx in range(num_batches):
             start_idx = batch_idx * f['batch_size']
             end_idx = (batch_idx+1) * f['batch_size']
@@ -142,6 +144,7 @@ def eval_one_epoch(f, sess, ops, has_aux):
                          ops['labels_pl']: current_label[start_idx:end_idx],
                          ops['is_training_pl']: is_training}
             # fetched data & run
+            start_time = time.time()
             if has_aux:
                 fetches = [ops['predict'],
                            ops['loss'],
@@ -154,6 +157,8 @@ def eval_one_epoch(f, sess, ops, has_aux):
                 fetches = [ops['predict'],
                            ops['loss']]
                 pred_val, loss_val = sess.run(fetches=fetches, feed_dict=feed_dict)
+            end_time = time.time()
+            total_time += end_time - start_time
             # collect
             pred_val = np.argmax(pred_val, axis=1)
             correct = np.sum(pred_val == current_label[start_idx:end_idx])
@@ -171,7 +176,7 @@ def eval_one_epoch(f, sess, ops, has_aux):
             #
             bar.update(batch_idx)
         bar.finish()
-
+        log_string('ms per sample: %f' % (total_time*1000/num_batches/f['batch_size']))
         dump_file.close()
 
     class_accuracies = np.array(total_correct_class) / np.array(total_seen_class, dtype=np.float)

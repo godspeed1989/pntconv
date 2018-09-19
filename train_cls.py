@@ -133,10 +133,22 @@ def train(f):
         train_writer = tf.summary.FileWriter(os.path.join(f['log_dir'], 'train'), sess.graph)
         test_writer = tf.summary.FileWriter(os.path.join(f['log_dir'], 'test'), sess.graph)
 
-        # INIT variables to start a new training
-        log_string('initialize variables')
-        init_op = tf.group(tf.global_variables_initializer(), tf.local_variables_initializer())
-        sess.run(init_op)
+        if f['contiune_training']:
+            # LOAD weights to continue training
+            checkpoint_file = tf.train.latest_checkpoint(f['weights_dir'])
+            log_string('restore %s' % checkpoint_file)
+            saver.restore(sess, checkpoint_file)
+        else:
+            # INIT variables to start a new training
+            log_string('initialize variables')
+            init_op = tf.group(tf.global_variables_initializer(), tf.local_variables_initializer())
+            sess.run(init_op)
+            if f['enable_rtn']:
+                checkpoint_file = tf.train.latest_checkpoint(f['rtn_weights_dir'])
+                log_string('restore RTN %s' % checkpoint_file)
+                rtn_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='RotTransNet')
+                rtn_saver = tf.train.Saver(var_list={v.op.name: v for v in rtn_vars})
+                rtn_saver.restore(sess, checkpoint_file)
 
         ops = {
             # input
@@ -200,7 +212,12 @@ def train_one_epoch(f, sess, ops, train_writer):
             start_idx = batch_idx * f['batch_size']
             end_idx = (batch_idx+1) * f['batch_size']
             # Augment batched point clouds by rotation and jittering
-            rotated_data = pc_util.rotate_point_cloud(current_data[start_idx:end_idx, :, :])
+            if f['aug_rotation'] == 1:
+                rotated_data = pc_util.rotate_point_cloud_1(current_data[start_idx:end_idx, :, :])
+            elif f['aug_rotation'] == 2:
+                rotated_data = pc_util.rotate_point_cloud_2(current_data[start_idx:end_idx, :, :])
+            else:
+                rotated_data = current_data[start_idx:end_idx, :, :]
             jittered_data = pc_util.jitter_point_cloud(rotated_data)
             shuffled_data = pc_util.shuffle_point_cloud(jittered_data)
             # feed data

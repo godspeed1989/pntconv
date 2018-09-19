@@ -79,7 +79,7 @@ def visualization(f, cfmtrx, maxpnt, tsne, weights_hist):
         points = ftest['data'][:, 0:f['num_point'], :]
         assert max_idx.shape[0] == points.shape[0]
         # random choose to show
-        shows = np.random.random_integers(0, max_idx.shape[0], 2)
+        shows = np.random.random_integers(0, max_idx.shape[0], 20)
         pc_list = []
         for s in range(shows.shape[0]):
             i = shows[s]
@@ -164,8 +164,12 @@ def plot_TSNE(labels, features, num_class):
     sct = ax.scatter(Y[:, 0], Y[:, 1], s=20, c=labels, cmap=discrete_cmap(num_class))
     cbar = plt.colorbar(sct, ticks=range(num_class))
     labels = []
+    i = 0
     for k in label_modelnet.keys():
+        i += 1
         labels.append(k)
+        if i >= num_class:
+            break
     cbar.set_ticklabels(labels)
     cbar.set_clim(-0.5, num_class - 0.5)
     plt.tight_layout()

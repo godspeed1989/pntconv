@@ -8,9 +8,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(BASE_DIR)
 sys.path.append(os.path.join(BASE_DIR, '../utils'))
 sys.path.append(os.path.join(BASE_DIR, '../fps'))
+sys.path.append(os.path.join(BASE_DIR, '../RTN'))
 import tf_util
 from util import run_tetris
 from color import colors
+from RTN import RotTransNet, get_rot_mat
 
 ''' Compute pairwise distance of a point cloud
 input
@@ -49,7 +51,7 @@ def perm_xyz(data, permutation):
     with tf.variable_scope('perm_xyz'):
         # *** batch indices
         # [[0],[1],...,[n]]
-        batch_size = data.get_shape()[0]
+        batch_size = data.get_shape()[0].value
         batch_idx = tf.reshape(tf.range(batch_size, dtype=tf.int32), shape=[batch_size, 1])
         # [[0,0,0],[1,1,1],...,[n,n,n]]
         batch_idx = tf.tile(batch_idx, [1, 3])
@@ -78,8 +80,8 @@ Args:
 Returns:
     (N, P, C), (N, P, K, C)
 """
-def get_nn(pts, nn_idx):
-    with tf.variable_scope('get_nn'):
+def get_nn_feature(pts, nn_idx, conf):
+    with tf.variable_scope('get_nn_feature'):
         batch_size = pts.get_shape()[0].value
         num_points = pts.get_shape()[1].value
         num_dims = pts.get_shape()[2].value
@@ -108,43 +110,6 @@ def get_nn(pts, nn_idx):
         pts_xyz_central = tf.tile(tf.expand_dims(pts_xyz, axis=-2), [1, 1, k, 1])
         pts_yzx_central = tf.tile(tf.expand_dims(pts_yzx, axis=-2), [1, 1, k, 1])
         pts_zxy_central = tf.tile(tf.expand_dims(pts_zxy, axis=-2), [1, 1, k, 1])
-
-        # Feature Organization
-        # (N, P, C)
-        # pow
-        pts_xyz2 = tf.pow(pts_xyz, 2)
-        pts_xyz3 = tf.pow(pts_xyz, 3)
-        # mean
-        pts_xyz_mean = tf.reduce_mean(pts_xyz, axis=1, keepdims=True)
-        pts_xyz_mean = tf.tile(pts_xyz_mean, [1,num_points,1])
-        pts_xyz2_mean = tf.reduce_mean(pts_xyz2, axis=1, keepdims=True)
-        pts_xyz2_mean = tf.tile(pts_xyz2_mean, [1,num_points,1])
-        pts_xyz3_mean = tf.reduce_mean(pts_xyz3, axis=1, keepdims=True)
-        pts_xyz3_mean = tf.tile(pts_xyz3_mean, [1,num_points,1])
-        # xy, yz, zx
-        pts_p2 = tf.multiply(pts_xyz, pts_yzx)
-        # xxy, yyz, zzx
-        pts_p31 = tf.multiply(pts_xyz2, pts_yzx)
-        # xxz, yyx, zzy
-        pts_p32 = tf.multiply(pts_xyz2, pts_zxy)
-        # L2
-        pts_l2 = tf.reduce_sum(pts_xyz2, axis=-1, keepdims=True)
-        pts_l2 = tf.sqrt(pts_l2)
-        # distance
-        pts_yzx2 = tf.pow(pts_yzx, 2)
-        pts_dist = pts_xyz2 + pts_yzx2
-        pts_dist = tf.sqrt(pts_dist)
-        # angle
-        pts_l2_ext = tf.add(pts_l2, 0.00001) # prevent div zero
-        pts_l2_ext = tf.tile(pts_l2_ext, [1,1,3])
-        pts_angle = tf.div(pts_dist, pts_l2_ext)
-        pts_angle = tf.acos(pts_angle)
-        # concat
-        pc_feature = tf.concat([pts_xyz, pts_xyz2, pts_xyz3,
-                                pts_xyz_mean, pts_xyz2_mean, pts_xyz3_mean,
-                                pts_p2, pts_p31, pts_p32,
-                                pts_l2, pts_dist, pts_angle],
-                                axis=-1)
 
         # (N, P, K, C)
         edge_xyz_feature = pts_xyz_neighbors - pts_xyz_central # centroid
@@ -181,60 +146,114 @@ def get_nn(pts, nn_idx):
 
         # concat
         nn_feature = tf.concat([edge_xyz_feature, edge_xyz_feature2, edge_xyz_feature3,
-                                edge_xyz_feature_mean, edge_xyz_feature2_mean, edge_xyz_feature3_mean,
-                                edge_feature_p2, edge_feature_p31, edge_feature_p32,
-                                edge_feature_l2, edge_feature_dist, edge_feature_angle],
+                                edge_feature_p2, edge_feature_p31, edge_feature_p32],
                                 axis=-1)
+        if conf.with_mean_rep: nn_feature = tf.concat([nn_feature, edge_xyz_feature_mean, edge_xyz_feature2_mean, edge_xyz_feature3_mean], axis=-1)
+        if conf.with_dist_rep: nn_feature = tf.concat([nn_feature, edge_feature_l2, edge_feature_dist], axis=-1)
+        if conf.with_angle_rep: nn_feature = tf.concat([nn_feature, edge_feature_angle], axis=-1)
 
-        return pc_feature, nn_feature
+        return nn_feature
 
-def LinearCombLayer(pc_feat, nn_feat, channels, conf):
-    with tf.variable_scope('LinearCombLayer', reuse=False):
-        # (N, P, C) -> (N, P, 1, C)
-        pc_feat = tf.expand_dims(pc_feat, axis=-2)
+def get_pc_feature(pts, conf):
+    with tf.variable_scope('get_pc_feature'):
+        num_points = pts.get_shape()[1].value
+
+        pts_xyz = pts
+        pts_yzx = perm_xyz(pts_xyz, [1,2,0])
+        pts_zxy = perm_xyz(pts_xyz, [2,0,1])
+
+        # Feature Organization
+        # (N, P, C)
+        # pow
+        pts_xyz2 = tf.pow(pts_xyz, 2)
+        pts_xyz3 = tf.pow(pts_xyz, 3)
+        # mean
+        pts_xyz_mean = tf.reduce_mean(pts_xyz, axis=1, keepdims=True)
+        pts_xyz_mean = tf.tile(pts_xyz_mean, [1,num_points,1])
+        pts_xyz2_mean = tf.reduce_mean(pts_xyz2, axis=1, keepdims=True)
+        pts_xyz2_mean = tf.tile(pts_xyz2_mean, [1,num_points,1])
+        pts_xyz3_mean = tf.reduce_mean(pts_xyz3, axis=1, keepdims=True)
+        pts_xyz3_mean = tf.tile(pts_xyz3_mean, [1,num_points,1])
+        # xy, yz, zx
+        pts_p2 = tf.multiply(pts_xyz, pts_yzx)
+        # xxy, yyz, zzx
+        pts_p31 = tf.multiply(pts_xyz2, pts_yzx)
+        # xxz, yyx, zzy
+        pts_p32 = tf.multiply(pts_xyz2, pts_zxy)
+        # L2
+        pts_l2 = tf.reduce_sum(pts_xyz2, axis=-1, keepdims=True)
+        pts_l2 = tf.sqrt(pts_l2)
+        # distance
+        pts_yzx2 = tf.pow(pts_yzx, 2)
+        pts_dist = pts_xyz2 + pts_yzx2
+        pts_dist = tf.sqrt(pts_dist)
+        # angle
+        pts_l2_ext = tf.add(pts_l2, 0.00001) # prevent div zero
+        pts_l2_ext = tf.tile(pts_l2_ext, [1,1,3])
+        pts_angle = tf.div(pts_dist, pts_l2_ext)
+        pts_angle = tf.acos(pts_angle)
+        # concat
+        pc_feature = tf.concat([pts_xyz, pts_xyz2, pts_xyz3,
+                                pts_p2, pts_p31, pts_p32],
+                                axis=-1)
+        if conf.with_mean_rep: pc_feature = tf.concat([pc_feature, pts_xyz_mean, pts_xyz2_mean, pts_xyz3_mean], axis=-1)
+        if conf.with_dist_rep: pc_feature = tf.concat([pc_feature, pts_l2, pts_dist], axis=-1)
+        if conf.with_angle_rep: pc_feature = tf.concat([pc_feature, pts_angle], axis=-1)
+
+        return pc_feature
+
+def RotTransLayer(pc, conf):
+    net = RotTransNet(pc, is_training=conf.is_training, bn_decay=conf.bn_decay, trainable=False)
+    with tf.variable_scope('RTN'):
+        mrotx = get_rot_mat('x', -net[:,0])
+        pc = tf.matmul(pc, mrotx)
+        mroty = get_rot_mat('y', -net[:,1])
+        pc = tf.matmul(pc, mroty)
+        mrotz = get_rot_mat('z', -net[:,2])
+        pc = tf.matmul(pc, mrotz)
+        print(colors.warning('RTN'))
+    return pc
+
+def LinearCombLayer(feat, channels, scope, expand, conf):
+    with tf.variable_scope(scope, reuse=False):
+        if expand:
+            # (N, P, C) -> (N, P, 1, C)
+            feat = tf.expand_dims(feat, axis=-2)
         # (N, P, 1\K, C) -> (N, P, 1\K, channels)
         conv2d_scope = 'conv2d_' + str(channels)
-        pc_feature = tf_util.conv2d(pc_feat, channels, [1,1],
-                                    padding='VALID', stride=[1,1],
-                                    bn=True, is_training=conf.is_training,
-                                    scope=conv2d_scope + '_pc', bn_decay=conf.bn_decay,
-                                    activation_fn=None)
-        nn_feature = tf_util.conv2d(nn_feat, channels, [1,1],
-                                    padding='VALID', stride=[1,1],
-                                    bn=True, is_training=conf.is_training,
-                                    scope=conv2d_scope + '_nn', bn_decay=conf.bn_decay,
-                                    activation_fn=None)
-        # (N, P, 1, channels) -> (N, P, channels)
-        pc_feature = tf.squeeze(pc_feature, axis=2)
-        # (N, P, K, channels) -> (N, P, channels)
-        nn_feature = tf.reduce_max(nn_feature, axis=2, keepdims=False)
-    print(colors.warning('LinearCombLayerPC'), colors.info(pc_feat.shape), colors.info(pc_feature.shape))
-    print(colors.warning('LinearCombLayerNN'), colors.info(nn_feat.shape), colors.info(nn_feature.shape))
-    return pc_feature, nn_feature
+        if conf.with_LC:
+            activation = None
+        else:
+            activation = tf.nn.elu
+        feature = tf_util.conv2d(feat, channels, [1,1],
+                                 padding='VALID', stride=[1,1],
+                                 bn=True, is_training=conf.is_training,
+                                 scope=conv2d_scope, bn_decay=conf.bn_decay,
+                                 activation_fn=activation)
+        if expand:
+            # (N, P, 1, channels) -> (N, P, channels)
+            feature = tf.squeeze(feature, axis=2)
+        else:
+            # (N, P, K, channels) -> (N, P, channels)
+            feature = tf.reduce_max(feature, axis=2, keepdims=False)
+    print(colors.warning(scope), colors.info(feat.shape), colors.info(feature.shape))
+    return feature
 
-def FeatureMapLayer(pc_feat, nn_feat, channels, conf):
-    with tf.variable_scope('FeatureMapLayer', reuse=False):
+def FeatureMapLayer(feat, channels, scope, conf):
+    with tf.variable_scope(scope, reuse=False):
         # (N, P, C) -> (N, P, 1, C)
-        pc_feat = tf.expand_dims(pc_feat, axis=-2)
-        nn_feat = tf.expand_dims(nn_feat, axis=-2)
+        feat = tf.expand_dims(feat, axis=-2)
         # (N, P, 1, C) -> (N, P, 1, channels)
         conv2d_scope = 'conv2d_' + str(channels)
-        pc_feature = tf_util.conv2d(pc_feat, channels, [1,1],
-                                    padding='VALID', stride=[1,1],
-                                    bn=True, is_training=conf.is_training,
-                                    scope=conv2d_scope + '_pc', bn_decay=conf.bn_decay,
-                                    activation_fn=tf.nn.elu)
-        nn_feature = tf_util.conv2d(nn_feat, channels, [1,1],
-                                    padding='VALID', stride=[1,1],
-                                    bn=True, is_training=conf.is_training,
-                                    scope=conv2d_scope + '_nn', bn_decay=conf.bn_decay,
-                                    activation_fn=tf.nn.elu)
+        feature = tf_util.conv2d(feat, channels, [1,1],
+                                 padding='VALID', stride=[1,1],
+                                 bn=True, is_training=conf.is_training,
+                                 scope=conv2d_scope, bn_decay=conf.bn_decay,
+                                 activation_fn=tf.nn.elu)
         # (N, P, 1, channels) -> (N, P, channels)
-        pc_feature = tf.squeeze(pc_feature, axis=2)
-        nn_feature = tf.squeeze(nn_feature, axis=2)
-    print(colors.warning('FeatureMapLayerPC'), colors.info(pc_feat.shape), colors.info(pc_feature.shape))
-    print(colors.warning('FeatureMapLayerNN'), colors.info(nn_feat.shape), colors.info(nn_feature.shape))
-    return pc_feature, nn_feature
+        feature = tf.squeeze(feature, axis=2)
+    print(colors.warning(scope), colors.info(feat.shape), colors.info(feature.shape))
+    return feature
 
 def SetConvLayer(pt_feat, channels, tag, conf, bnorm=True, activation=tf.nn.elu):
     with tf.variable_scope(tag):
@@ -252,14 +271,17 @@ def SetConvLayer(pt_feat, channels, tag, conf, bnorm=True, activation=tf.nn.elu)
         print(colors.warning(tag), colors.info(pt_feat.shape), colors.info(pt_feature.shape))
     return pt_feature
 
-def GetNNFeature(pts, K, tag):
+def GetNNFeature(pts, K, tag, conf):
     with tf.variable_scope(tag):
         # get nearest neighbors index (N, K)
         adj_matrix = batch_distance_matrix_general(pts)
-        nn_idx = knn(adj_matrix, k=K, with_first=False)
+        nn_idx = knn(adj_matrix, k=K, with_first=True)
         # extract neighbor (N, P, C) -> (N, P, C+C*K)
-        nn_feat = get_nn(pts, nn_idx=nn_idx)
-    return nn_feat
+        nn_feature = get_nn_feature(pts, nn_idx=nn_idx, conf=conf)
+    return nn_feature
+
+def GetPCFeature(pts, conf):
+    return get_pc_feature(pts, conf)
 
 """
     pass configuration between train and model
@@ -271,6 +293,15 @@ class pntconv_cls_conf():
         self.bn_decay = args['bn_decay']
         self.num_class = args['num_class']
         self.batch_size = args['batch_size']
+        self.enable_rtn = args['enable_rtn']
+        self.num_neighbor = args['num_neighbor']
+        self.with_LC = args['with_LC']
+        self.with_mean_rep = args['with_mean_rep']
+        self.with_dist_rep =  args['with_dist_rep']
+        self.with_angle_rep = args['with_angle_rep']
+        self.with_shortcut = args['with_shortcut']
+        self.with_pc_feature = args['with_pc_feature']
+        self.with_nn_feature = args['with_nn_feature']
 
     def exists_and_is_not_none(self, attribute):
         return hasattr(self, attribute) and getattr(self, attribute) is not None
@@ -308,15 +339,26 @@ class pntconv_cls():
         c = self.configuration
         print(colors.warning('Input'), colors.info(point_cloud.shape))
 
-        pc_feat, nn_feat = GetNNFeature(point_cloud, 32, 'GetNNFeature')
-        print(colors.warning('PC_Feature'), colors.info(pc_feat.shape))
-        print(colors.warning('NN_Feature'), colors.info(nn_feat.shape))
-        # linear combination
-        pc_feat, nn_feat = LinearCombLayer(pc_feat, nn_feat, 128, c)
-        # nonlinear feature mapping
-        pc_feat, nn_feat = FeatureMapLayer(pc_feat, nn_feat, 128, c)
+        if c.enable_rtn:
+            point_cloud = RotTransLayer(point_cloud, c)
+
+        all_features = []
+        if c.with_shortcut:
+            all_features.append(point_cloud)
+        if c.with_pc_feature:
+            pc_feat = GetPCFeature(point_cloud, c)
+            print(colors.warning('PC_Feature'), colors.info(pc_feat.shape))
+            pc_feat = LinearCombLayer(pc_feat, 128, 'LinearCombLayerPC', True, c)
+            pc_feat = FeatureMapLayer(pc_feat, 128, 'FeatureMapLayerPC', c)
+            all_features.append(pc_feat)
+        if c.with_nn_feature:
+            nn_feat = GetNNFeature(point_cloud, c.num_neighbor, 'GetNNFeature', c)
+            print(colors.warning('NN_Feature'), colors.info(nn_feat.shape))
+            nn_feat = LinearCombLayer(nn_feat, 128, 'LinearCombLayerNN', False, c)
+            nn_feat = FeatureMapLayer(nn_feat, 128, 'FeatureMapLayerNN', c)
+            all_features.append(nn_feat)
         #
-        pt_feat = tf.concat([point_cloud, pc_feat, nn_feat], axis=2)
+        pt_feat = tf.concat(all_features, axis=2)
         #
         pt_feat = SetConvLayer(pt_feat, 256, 'SetConv_1', c)
         #
@@ -332,11 +374,11 @@ class pntconv_cls():
         # MLP on global point cloud vector
         with tf.variable_scope('MLP_classify'):
             net = tf_util.fully_connected(net, 512, bn=True, is_training=c.is_training,
-                                        scope='fc1', bn_decay=c.bn_decay)
+                                        scope='fc1', bn_decay=c.bn_decay, activation_fn=tf.nn.elu)
             net = tf_util.dropout(net, keep_prob=0.5, is_training=c.is_training,
                                 scope='dp1')
             net = tf_util.fully_connected(net, 256, bn=True, is_training=c.is_training,
-                                        scope='fc2', bn_decay=c.bn_decay)
+                                        scope='fc2', bn_decay=c.bn_decay, activation_fn=tf.nn.elu)
             net = tf_util.dropout(net, keep_prob=0.5, is_training=c.is_training,
                                 scope='dp2')
             net = tf_util.fully_connected(net, c.num_class, activation_fn=None, scope='fc3')
